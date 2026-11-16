@@ -237,6 +237,7 @@ class Trial:
 
         self.run(["rustup", "toolchain", "install", config["toolchain"], "--profile", "minimal"], self.work)
         self.environment["RUSTUP_TOOLCHAIN"] = config["toolchain"]
+        self.environment["CODEX_REPO_ROOT"] = str(source)
         self.environment["PYTHONPATH"] = str(source / "scripts")
         code = ("import json; from pathlib import Path; from codex_package.targets import TARGET_SPECS; "
                 "from codex_package.v8 import resolve_codex_v8_cargo_env; "

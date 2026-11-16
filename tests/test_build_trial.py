@@ -200,6 +200,49 @@ class BuildTrialTests(unittest.TestCase):
             normalized,
         )
 
+    def testBuildSetsControlledRepositoryRootBeforeV8Resolver(self):
+        class StopAtV8Resolver(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "work"
+            work.mkdir()
+            source = work / "source"
+            workspace = source / "codex-rs"
+            config = {
+                "version": "0.167.2",
+                "upstream_commit": "reviewed-commit",
+                "toolchain": "1.95.0",
+                "target": "x86_64-unknown-linux-gnu",
+                "patches": {},
+            }
+            trial = build_trial.Trial(
+                work,
+                work / "diagnostics",
+                {"CARGO_HOME": str(work / "cargo-home"), "CODEX_REPO_ROOT": "/untrusted/root"},
+            )
+
+            def fake_run(argv, _cwd, **_kwargs):
+                if argv[0] == "git" and argv[1] == "clone":
+                    workspace.mkdir(parents=True)
+                    (workspace / "Cargo.toml").write_text(
+                        '[workspace.package]\nversion = "0.167.2"\n'
+                    )
+                    return ""
+                if argv[:3] == ["git", "rev-parse", "HEAD"]:
+                    return config["upstream_commit"]
+                if argv[0] == "rustup":
+                    return ""
+                if argv[0] == sys.executable:
+                    self.assertEqual(str(source), trial.environment["CODEX_REPO_ROOT"])
+                    self.assertEqual(str(source / "scripts"), trial.environment["PYTHONPATH"])
+                    raise StopAtV8Resolver
+                self.fail(f"Unexpected build command before V8 resolution: {argv}")
+
+            with patch.object(trial, "run", side_effect=fake_run):
+                with self.assertRaises(StopAtV8Resolver):
+                    trial.build(Path(temporary), config)
+
     def testIsolatedEnvironmentUsesFreshHomeAndCodexHome(self):
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
