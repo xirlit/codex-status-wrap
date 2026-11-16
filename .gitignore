@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+target/
+work/
+dist/
+*.tar.gz
+*.zip
+.env
+.env.*
+auth.json
+credentials*

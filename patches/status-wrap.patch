@@ -1,0 +1,1225 @@
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index f8d8f9a..5da1f8f 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -2208,8 +2208,7 @@ async fn token_usage_update_refreshes_status_line_with_runtime_context_window()
+         )));
+         assert!(matches!(
+             (extensions, app.chat_widget.status_line_content()),
+-            (false, Some(FooterContent::HyperlinkLine(_)))
+-                | (true, Some(FooterContent::Extension { .. }))
++            (_, Some(FooterContent::StatusFields { .. }))
+         ));
+         let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 60);
+         assert!(
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index bcc2456..9d4b732 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -4700,7 +4700,7 @@ impl ChatComposer {
+             }
+             None => {
+                 let footer_props = self.hint_footer_props(options);
+-                let show_cycle_hint = self.status_surface_height(options) == 0
++                let show_cycle_hint = !self.has_status_surface(options)
+                     && !footer_props.is_task_running
+                     && self.footer.collaboration_mode_indicator.is_some();
+                 let show_shortcuts_hint = match footer_props.mode {
+@@ -4751,19 +4751,8 @@ impl ChatComposer {
+                             .effort_status_line_transition
+                             .as_ref()
+                             .is_some_and(|transition| !transition.is_finished());
+-                    let combined_status_line = if status_line_visible
+-                        && let Some(transition) = &self.effort_status_line_transition
+-                        && !transition.is_finished()
+-                    {
+-                        let current = combined_status_line.map(FooterContent::into_hyperlink_line);
+-                        transition
+-                            .render_line(current, status_line_width)
+-                            .map(FooterContent::HyperlinkLine)
+-                    } else {
+-                        combined_status_line
+-                    };
+                     let left_mode_indicator =
+-                        if status_line_active || self.status_surface_height(options) > 0 {
++                        if status_line_active || self.has_status_surface(options) {
+                             None
+                         } else {
+                             self.footer.collaboration_mode_indicator
+@@ -4795,17 +4784,15 @@ impl ChatComposer {
+                             Some(side_conversation_context_line(label))
+                         } else if let Some(line) = self.shell_mode_footer_line() {
+                             Some(line)
+-                        } else if self.status_surface_height(options) > 0 || transition_active {
++                        } else if self.has_status_surface(options) || transition_active {
+                             None
+                         } else if status_line_active {
+-                            let full = self.mode_indicator_line(show_cycle_hint);
+-                            let compact = self.mode_indicator_line(/*show_cycle_hint*/ false);
+-                            let full_width = full.as_ref().map(|l| l.width() as u16).unwrap_or(0);
+-                            if can_show_left_with_context(hint_rect, left_width, full_width) {
+-                                full
+-                            } else {
+-                                compact
+-                            }
++                            self.passive_status_right_line(
++                                hint_rect,
++                                left_width,
++                                options,
++                                transition_active,
++                            )
+                         } else {
+                             Some(self.right_footer_line_with_context())
+                         };
+@@ -4885,15 +4872,17 @@ impl ChatComposer {
+                     } else if let Some(items) = active_footer_hint_override {
+                         render_footer_hint_items(hint_rect, buf, items);
+                     } else if status_line_active {
+-                        if let Some(content) = combined_status_line {
+-                            content.render(
+-                                Rect {
+-                                    width: status_line_width,
+-                                    ..inset_footer_hint_area(hint_rect)
+-                                },
+-                                buf,
+-                            );
+-                        }
++                        self.render_status_content(
++                            combined_status_line,
++                            Rect {
++                                width: status_line_width,
++                                ..inset_footer_hint_area(hint_rect)
++                            },
++                            buf,
++                            self.effort_status_line_transition
++                                .as_ref()
++                                .filter(|_| transition_active),
++                        );
+                     } else {
+                         render_footer_from_props(
+                             hint_rect,
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/composer_layout.rs b/codex-rs/tui/src/bottom_pane/chat_composer/composer_layout.rs
+index d687ed0..7dbdb6a 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/composer_layout.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/composer_layout.rs
+@@ -43,7 +43,7 @@ impl ChatComposer {
+     ) -> ComposerLayout {
+         let footer_hint_height = self.footer_hint_height(area.width, options);
+         // Preserve input and hints before allocating the persistent status row.
+-        let status_height = self.status_surface_height(options).min(
++        let status_height = self.status_surface_height(area.width, options).min(
+             area.height
+                 .saturating_sub(footer_hint_height.saturating_add(/*rhs*/ 3)),
+         );
+@@ -210,7 +210,7 @@ impl ChatComposer {
+             + remote_images_height
+             + self.thumbnail_height(inner_width, options)
+             + remote_images_separator
+-            + self.status_surface_height(options)
++            + self.status_surface_height(width, options)
+             + if self.shortcuts_above_composer(options) {
+                 footer_height(&self.hint_footer_props(options), width)
+             } else {
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+index 85ba7e9..b838c12 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+@@ -281,15 +281,23 @@ impl super::ChatComposer {
+     }
+ 
+     pub(super) fn footer_hint_height(&self, width: u16, options: ComposerRenderOptions<'_>) -> u16 {
+-        if self.show_warning_notice(options) || self.shortcuts_above_composer(options) {
++        if self.shortcuts_above_composer(options) {
+             return 1;
+         }
+         options
+             .footer
+             .map_or_else(
+                 || {
+-                    self.custom_footer_height()
+-                        .unwrap_or_else(|| footer_height(&self.hint_footer_props(options), width))
++                    self.custom_footer_height().unwrap_or_else(|| {
++                        self.passive_status_height(width, options)
++                            .unwrap_or_else(|| {
++                                if self.show_warning_notice(options) {
++                                    1
++                                } else {
++                                    footer_height(&self.hint_footer_props(options), width)
++                                }
++                            })
++                    })
+                 },
+                 |footer| footer.text.height().try_into().unwrap_or(u16::MAX),
+             )
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/status_surface.rs b/codex-rs/tui/src/bottom_pane/chat_composer/status_surface.rs
+index d05f8ad..1a7d798 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/status_surface.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/status_surface.rs
+@@ -1,17 +1,33 @@
+ //! Separate persistent transcript context from the composer's transient hint row.
+ //! Measurement, rendering, and cursor placement share the same reserved status rectangle.
++//! Configured fields wrap at field boundaries after reserving right-side indicators.
++//! Effort transitions animate the first row while retaining subsequent status rows.
+ //! Shortcut help grows above the input, preserving status and close rows below it even when clipped.
+ 
+ use super::*;
+ 
+ impl ChatComposer {
+-    pub(super) fn status_surface_height(&self, options: ComposerRenderOptions<'_>) -> u16 {
+-        u16::from(options.separate_status_line && self.footer.status_line_enabled)
++    pub(super) fn status_surface_height(
++        &self,
++        width: u16,
++        options: ComposerRenderOptions<'_>,
++    ) -> u16 {
++        if !self.has_status_surface(options) {
++            return 0;
++        }
++        let (content, _, width) = self.status_surface_content(width, options);
++        content
++            .as_ref()
++            .map_or(1, |content| content.height(width).max(1))
++    }
++
++    pub(super) fn has_status_surface(&self, options: ComposerRenderOptions<'_>) -> bool {
++        options.separate_status_line && self.footer.status_line_enabled
+     }
+ 
+     pub(super) fn hint_footer_props(&self, options: ComposerRenderOptions<'_>) -> FooterProps {
+         let mut props = self.footer_props();
+-        if self.status_surface_height(options) > 0 {
++        if self.has_status_surface(options) {
+             props.status_line_enabled = false;
+             props.status_line_value = None;
+             props.active_agent_label = None;
+@@ -28,6 +44,37 @@ impl ChatComposer {
+         if area.is_empty() {
+             return;
+         }
++        let (content, right, width) = self.status_surface_content(area.width, options);
++        let transition = self
++            .effort_status_line_transition
++            .as_ref()
++            .filter(|transition| !transition.is_finished());
++        self.render_status_content(
++            content,
++            Rect {
++                width,
++                ..inset_footer_hint_area(area)
++            },
++            buf,
++            transition,
++        );
++
++        if let Some(right) = right {
++            render_context_right(area, buf, &right);
++        }
++        if transition.is_some()
++            && let Some(frame_requester) = &self.frame_requester
++        {
++            frame_requester.schedule_frame_in(EFFORT_STATUS_LINE_FRAME_TICK);
++        }
++    }
++
++    fn status_surface_content(
++        &self,
++        width: u16,
++        options: ComposerRenderOptions<'_>,
++    ) -> (Option<FooterContent>, Option<Line<'static>>, u16) {
++        let area = Rect::new(0, 0, width, 1);
+         let mut props = self.footer_props();
+         let show_cycle_hint = !props.is_task_running
+             && !self.blocks_direct_input
+@@ -54,39 +101,113 @@ impl ChatComposer {
+         } else {
+             self.mode_indicator_line(/*show_cycle_hint*/ false)
+         };
++
+         let right_width = right
+             .as_ref()
+             .map_or(/*default*/ 0, |line| line.width() as u16);
+         let width = max_left_width_for_right(area, right_width)
+             .unwrap_or_else(|| inset_footer_hint_area(area).width);
+-        let transition = self
++
++        (line, right, width)
++    }
++
++    pub(super) fn passive_status_height(
++        &self,
++        width: u16,
++        options: ComposerRenderOptions<'_>,
++    ) -> Option<u16> {
++        let props = self.hint_footer_props(options);
++        if !uses_passive_footer_status_layout(&props) {
++            return None;
++        }
++        let content = passive_footer_status_line(&props)?;
++        let mut area = Rect::new(0, 0, width, 1);
++        if let Some((warning_area, _)) =
++            self.warning_notice_layout(inset_footer_hint_area(area), options)
++        {
++            area.width = warning_area.x.saturating_sub(area.x).saturating_sub(2);
++        }
++
++        let transition_active = self
+             .effort_status_line_transition
+             .as_ref()
+-            .filter(|transition| !transition.is_finished());
+-        let content = if let Some(transition) = transition {
+-            let current = line.map(FooterContent::into_hyperlink_line);
+-            transition
+-                .render_line(current, width)
+-                .map(FooterContent::HyperlinkLine)
++            .is_some_and(|transition| !transition.is_finished());
++        let right =
++            self.passive_status_right_line(area, content.width(), options, transition_active);
++        let right_width = right.as_ref().map_or(0, |line| line.width() as u16);
++        let width = max_left_width_for_right(area, right_width)
++            .unwrap_or_else(|| area.width.saturating_sub(FOOTER_INDENT_COLS as u16));
++
++        Some(content.height(width).max(1))
++    }
++
++    pub(super) fn passive_status_right_line(
++        &self,
++        area: Rect,
++        left_width: u16,
++        options: ComposerRenderOptions<'_>,
++        transition_active: bool,
++    ) -> Option<Line<'static>> {
++        if let Some(label) = self.footer.side_conversation_context_label.as_ref() {
++            return Some(side_conversation_context_line(label));
++        }
++        if let Some(line) = self.shell_mode_footer_line() {
++            return Some(line);
++        }
++        if self.has_status_surface(options) || transition_active {
++            return None;
++        }
++        let show_cycle_hint =
++            !self.is_task_running && self.footer.collaboration_mode_indicator.is_some();
++        let full = self.mode_indicator_line(show_cycle_hint);
++        let full_width = full.as_ref().map_or(0, |line| line.width() as u16);
++        if can_show_left_with_context(area, left_width, full_width) {
++            full
+         } else {
+-            line
++            self.mode_indicator_line(/*show_cycle_hint*/ false)
++        }
++    }
++
++    pub(super) fn render_status_content(
++        &self,
++        content: Option<FooterContent>,
++        area: Rect,
++        buf: &mut Buffer,
++        transition: Option<&EffortStatusLineTransition>,
++    ) {
++        let Some(transition) = transition else {
++            if let Some(content) = content {
++                content.render(area, buf);
++            }
++            return;
+         };
+-        if let Some(content) = content {
+-            content.render(
++        let mut rows = content
++            .map(|content| content.wrapped_lines(area.width))
++            .unwrap_or_default()
++            .into_iter();
++
++        if let Some(frame) = transition.render_line(rows.next(), area.width) {
++            FooterContent::HyperlinkLine(frame).render(
+                 Rect {
+-                    width,
+-                    ..inset_footer_hint_area(area)
++                    height: area.height.min(1),
++                    ..area
+                 },
+                 buf,
+             );
+         }
+-        if let Some(right) = right {
+-            render_context_right(area, buf, &right);
+-        }
+-        if transition.is_some()
+-            && let Some(frame_requester) = &self.frame_requester
+-        {
+-            frame_requester.schedule_frame_in(EFFORT_STATUS_LINE_FRAME_TICK);
++        for (offset, row) in rows.enumerate() {
++            let offset = offset + 1;
++            if offset >= usize::from(area.height) {
++                break;
++            }
++            FooterContent::HyperlinkLine(row).render(
++                Rect {
++                    y: area.y + offset as u16,
++                    height: 1,
++                    ..area
++                },
++                buf,
++            );
+         }
+     }
+ }
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/status_surface_tests.rs b/codex-rs/tui/src/bottom_pane/chat_composer/status_surface_tests.rs
+index 3d429c1..0294ee5 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/status_surface_tests.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/status_surface_tests.rs
+@@ -23,21 +23,20 @@ fn composer() -> ChatComposer {
+ }
+ 
+ #[test]
+-fn extension_status_line_clips_links_to_footer_layout() {
++fn configured_extension_status_fields_wrap_with_complete_links() {
++    use crate::bottom_pane::status_line_content::StatusLineRenderer;
++    use crate::bottom_pane::status_line_setup::StatusLineItem;
++
+     let mut composer = composer();
+-    let tree = serde_json::from_value(serde_json::json!({
+-        "type": "row", "props": {}, "children": [
+-            { "type": "text", "props": { "text": "plain" } },
+-            { "type": "row", "props": {}, "children": [
+-                { "type": "text", "props": { "text": " · " } },
+-                { "type": "link", "props": { "href": "https://example.com/pr/42" }, "children": [
+-                    { "type": "text", "props": { "text": "PR #42" } }
+-                ] }
+-            ] }
+-        ]
+-    }))
+-    .unwrap();
+-    composer.set_status_line(Some(FooterContent::Extension { content: tree }));
++    composer.set_status_line(StatusLineRenderer::Extension.content(
++        [
++            (StatusLineItem::ModelName, "plain".to_string()),
++            (StatusLineItem::PullRequestNumber, "PR #42".to_string()),
++        ],
++        false,
++        None,
++        Some("https://example.com/pr/42"),
++    ));
+ 
+     for separate_status_line in [false, true] {
+         for width in [12, 40] {
+@@ -56,11 +55,24 @@ fn extension_status_line_clips_links_to_footer_layout() {
+             let linked = buffer
+                 .content
+                 .iter()
+-                .filter(|cell| cell.symbol().contains("https://example.com/pr/42"))
++                .enumerate()
++                .filter(|(_, cell)| cell.symbol().contains("https://example.com/pr/42"))
+                 .collect::<Vec<_>>();
+-            assert_eq!(linked.len(), if width == 12 { 1 } else { 6 }, "{buffer:?}");
+-            assert!(linked.iter().all(|cell| !cell.symbol().contains('…')));
+-            assert!(buffer.content.iter().any(|cell| cell.symbol() == "p"));
++            assert_eq!(linked.len(), 6, "{buffer:?}");
++            assert!(linked.iter().all(|(_, cell)| !cell.symbol().contains('…')));
++            let plain_row = buffer
++                .content
++                .iter()
++                .position(|cell| cell.symbol() == "p")
++                .unwrap()
++                / usize::from(width);
++            let linked_row = linked[0].0 / usize::from(width);
++            assert!(
++                linked
++                    .iter()
++                    .all(|(index, _)| index / usize::from(width) == linked_row)
++            );
++            assert_eq!(linked_row, plain_row + usize::from(width == 12));
+         }
+     }
+ 
+@@ -503,3 +515,290 @@ fn activity_shortcut_help_follows_runtime_binding() {
+     }
+     insta::assert_snapshot!(snapshots.join("\n---\n"));
+ }
++
++fn configured_fields(composer: &mut ChatComposer) {
++    use crate::bottom_pane::status_line_content::StatusLineRenderer;
++    use crate::bottom_pane::status_line_setup::StatusLineItem;
++
++    composer.set_status_line(StatusLineRenderer::Native.content(
++        [
++            (StatusLineItem::ModelName, "MODEL".into()),
++            (StatusLineItem::CurrentDir, "~/project".into()),
++            (StatusLineItem::GitBranch, "main".into()),
++            (StatusLineItem::UsedTokens, "12k tokens".into()),
++        ],
++        false,
++        None,
++        None,
++    ));
++}
++
++#[test]
++fn configured_fields_resize_without_overlapping_composer_input() {
++    let mut composer = composer();
++    configured_fields(&mut composer);
++    composer.set_text_content("draft".into(), Vec::new(), Vec::new());
++    for separate_status_line in [false, true] {
++        let options = ComposerRenderOptions {
++            separate_status_line,
++            ..Default::default()
++        };
++        let wide_height = composer.desired_height_with_options(80, options);
++        for width in [80, 16, 24, 80] {
++            let height = composer.desired_height_with_options(width, options);
++            let area = Rect::new(0, 0, width, height);
++            let layout = composer.layout_with_options(area, options);
++            let status = if separate_status_line {
++                layout.status
++            } else {
++                layout.footer
++            };
++            assert_eq!(layout.composer.bottom(), status.y);
++            assert!(layout.textarea.bottom() <= status.y);
++            assert_eq!(
++                status.height,
++                if width == 80 {
++                    1
++                } else if width == 16 {
++                    4
++                } else {
++                    2
++                }
++            );
++            assert_eq!(height, wide_height + status.height - 1);
++
++            let mut buf = Buffer::empty(area);
++            composer.render_with_options(area, &mut buf, None, options);
++            let rows = (status.y..status.bottom())
++                .map(|y| {
++                    (0..width)
++                        .map(|x| strip_osc8(buf[(x, y)].symbol()))
++                        .collect::<String>()
++                })
++                .collect::<Vec<_>>();
++            for field in ["MODEL", "~/project", "main", "12k tokens"] {
++                assert!(
++                    rows.iter().any(|row| row.contains(field)),
++                    "{width}: {rows:?}"
++                );
++            }
++            assert!(
++                composer
++                    .cursor_pos_with_options(area, options)
++                    .is_some_and(|(_, y)| y < status.y)
++            );
++        }
++    }
++}
++
++#[test]
++fn wrapped_status_keeps_warning_and_transient_hint_priority() {
++    let mut composer = composer();
++    configured_fields(&mut composer);
++    let options = ComposerRenderOptions {
++        warning_count: 2,
++        ..Default::default()
++    };
++    let width = 40;
++    let area = Rect::new(
++        0,
++        0,
++        width,
++        composer.desired_height_with_options(width, options),
++    );
++    let mut buf = Buffer::empty(area);
++    composer.render_with_options(area, &mut buf, None, options);
++    let text = (0..area.height)
++        .map(|y| {
++            (0..width)
++                .map(|x| strip_osc8(buf[(x, y)].symbol()))
++                .collect::<String>()
++        })
++        .collect::<Vec<_>>()
++        .join("\n");
++    for field in ["MODEL", "~/project", "main", "12k tokens", "⚠"] {
++        assert!(text.contains(field), "{text}");
++    }
++    assert!(composer.footer_hint_height(width, options) > 1);
++
++    composer.set_footer_hint_override(Some(vec![("ctrl+c".into(), "quit".into())]));
++    assert_eq!(composer.footer_hint_height(width, options), 1);
++
++    composer.set_footer_hint_override(None);
++    composer.show_footer_flash(Line::from("saved"), Duration::from_secs(60));
++    assert_eq!(composer.footer_hint_height(width, options), 1);
++}
++
++#[test]
++fn effort_transition_preserves_following_wrapped_status_rows() {
++    let mut composer = composer();
++    configured_fields(&mut composer);
++    let previous = composer
++        .footer
++        .status_line_value
++        .clone()
++        .unwrap()
++        .into_hyperlink_line();
++    composer.effort_status_line_transition =
++        Some(EffortStatusLineTransition::new(EffortTier::Ultra, previous));
++    for separate_status_line in [false, true] {
++        let options = ComposerRenderOptions {
++            separate_status_line,
++            ..Default::default()
++        };
++        let width = 16;
++        let area = Rect::new(
++            0,
++            0,
++            width,
++            composer.desired_height_with_options(width, options),
++        );
++        let layout = composer.layout_with_options(area, options);
++        let status = if separate_status_line {
++            layout.status
++        } else {
++            layout.footer
++        };
++        assert_eq!(status.height, 4);
++        let mut buf = Buffer::empty(area);
++        composer.render_with_options(area, &mut buf, None, options);
++        let rows = (status.y + 1..status.bottom())
++            .map(|y| {
++                (0..width)
++                    .map(|x| strip_osc8(buf[(x, y)].symbol()))
++                    .collect::<String>()
++            })
++            .collect::<Vec<_>>();
++        for field in ["~/project", "main", "12k tokens"] {
++            assert!(rows.iter().any(|row| row.contains(field)), "{rows:?}");
++        }
++    }
++}
++
++#[test]
++fn wrapped_status_reserves_the_compact_right_indicator_on_its_final_row() {
++    let mut composer = composer();
++    configured_fields(&mut composer);
++    composer.set_collaboration_modes_enabled(true);
++    composer.set_collaboration_mode_indicator(Some(CollaborationModeIndicator::Plan));
++    for separate_status_line in [false, true] {
++        let options = ComposerRenderOptions {
++            separate_status_line,
++            ..Default::default()
++        };
++        let width = 40;
++        let area = Rect::new(
++            0,
++            0,
++            width,
++            composer.desired_height_with_options(width, options),
++        );
++        let layout = composer.layout_with_options(area, options);
++        let status = if separate_status_line {
++            layout.status
++        } else {
++            layout.footer
++        };
++        assert!(status.height > 1);
++        let mut buf = Buffer::empty(area);
++        composer.render_with_options(area, &mut buf, None, options);
++        let rows = (status.y..status.bottom())
++            .map(|y| {
++                (0..width)
++                    .map(|x| strip_osc8(buf[(x, y)].symbol()))
++                    .collect::<String>()
++            })
++            .collect::<Vec<_>>();
++        for field in ["MODEL", "~/project", "main", "12k tokens"] {
++            assert!(rows.iter().any(|row| row.contains(field)), "{rows:?}");
++        }
++        assert!(rows.last().unwrap().contains("Plan"), "{rows:?}");
++    }
++}
++
++#[test]
++fn configured_renderers_retain_their_existing_active_agent_suffix_policy() {
++    use crate::bottom_pane::status_line_content::StatusLineRenderer;
++    use crate::bottom_pane::status_line_setup::StatusLineItem;
++
++    let mut composer = composer();
++    composer.set_active_agent_label(Some("worker".into()));
++    for renderer in [StatusLineRenderer::Native, StatusLineRenderer::Extension] {
++        composer.set_status_line(renderer.content(
++            [(StatusLineItem::ModelName, "MODEL".to_string())],
++            false,
++            None,
++            None,
++        ));
++        let status = passive_footer_status_line(&composer.footer_props())
++            .unwrap()
++            .into_hyperlink_line();
++        let text = status
++            .line
++            .spans
++            .iter()
++            .map(|span| span.content.as_ref())
++            .collect::<String>();
++        assert_eq!(
++            text.contains("worker"),
++            renderer == StatusLineRenderer::Native
++        );
++    }
++}
++
++#[test]
++fn empty_configured_renderers_preserve_active_agent_suffix_behavior() {
++    use crate::bottom_pane::status_line_content::StatusLineRenderer;
++    use crate::bottom_pane::status_line_setup::StatusLineItem;
++
++    let mut composer = composer();
++    composer.set_active_agent_label(Some("worker".into()));
++    for renderer in [StatusLineRenderer::Native, StatusLineRenderer::Extension] {
++        let content = renderer.content(
++            std::iter::empty::<(StatusLineItem, String)>(),
++            false,
++            None,
++            None,
++        );
++        assert_eq!(content.is_some(), renderer == StatusLineRenderer::Extension);
++        composer.set_status_line(content);
++        let status = passive_footer_status_line(&composer.footer_props())
++            .unwrap()
++            .into_hyperlink_line();
++        let text = status
++            .line
++            .spans
++            .iter()
++            .map(|span| span.content.as_ref())
++            .collect::<String>();
++        assert_eq!(
++            text.contains("worker"),
++            renderer == StatusLineRenderer::Native
++        );
++
++        for separate_status_line in [false, true] {
++            let options = ComposerRenderOptions {
++                separate_status_line,
++                ..Default::default()
++            };
++            let width = 40;
++            let area = Rect::new(
++                0,
++                0,
++                width,
++                composer.desired_height_with_options(width, options),
++            );
++            let mut buf = Buffer::empty(area);
++            composer.render_with_options(area, &mut buf, None, options);
++            let text = buf
++                .content
++                .iter()
++                .map(|cell| strip_osc8(cell.symbol()))
++                .collect::<String>();
++            assert_eq!(
++                text.contains("worker"),
++                renderer == StatusLineRenderer::Native
++            );
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/warning_notice.rs b/codex-rs/tui/src/bottom_pane/chat_composer/warning_notice.rs
+index f131f6e..b223d7a 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/warning_notice.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/warning_notice.rs
+@@ -1,5 +1,5 @@
+ //! Fit warning counts and the configured warnings shortcut into the existing passive hint row.
+-//! Interactive hints retain priority; warning delivery never changes composer geometry.
++//! Interactive hints retain priority; status fields reflow beside the warning notice.
+ //! Only the count and warning label receive an amber accent; surrounding hints stay muted.
+ 
+ use super::*;
+diff --git a/codex-rs/tui/src/bottom_pane/footer.rs b/codex-rs/tui/src/bottom_pane/footer.rs
+index 9d6a983..5a7f246 100644
+--- a/codex-rs/tui/src/bottom_pane/footer.rs
++++ b/codex-rs/tui/src/bottom_pane/footer.rs
+@@ -13,8 +13,9 @@
+ //! otherwise idle.
+ //!
+ //! Terminology used in this module:
+-//! - "status line" means the configurable contextual row built from `/statusline` items such as
+-//!   model, git branch, and context usage.
++//! - "status line" means the configurable contextual content built from `/statusline` items such as
++//!   model, git branch, and context usage. Whole fields wrap onto additional rows; an individually
++//!   oversized field is truncated with an ellipsis to stay inside the footer.
+ //! - "instructional footer" means a row that tells the user what to do next, such as quit
+ //!   confirmation, shortcut help, or queue hints.
+ //! - "contextual footer" means the footer is free to show ambient context instead of an
+@@ -235,6 +236,11 @@ pub(crate) fn reset_mode_after_activity(current: FooterMode) -> FooterMode {
+ }
+ 
+ pub(crate) fn footer_height(props: &FooterProps, width: u16) -> u16 {
++    if let Some(content) = passive_footer_status_line(props) {
++        return content
++            .height(width.saturating_sub(FOOTER_INDENT_COLS as u16))
++            .max(1);
++    }
+     match props.mode {
+         FooterMode::ShortcutOverlay => {
+             shortcut_overlay::lines(props, width.saturating_sub(FOOTER_INDENT_COLS as u16)).len()
+@@ -278,6 +284,10 @@ pub(crate) fn render_footer_from_props(
+         shortcut_overlay::render(props, inset_footer_hint_area(area), buf);
+         return;
+     }
++    if let Some(content @ FooterContent::StatusFields { .. }) = passive_footer_status_line(props) {
++        content.render(inset_footer_hint_area(area), buf);
++        return;
++    }
+     Paragraph::new(prefix_lines(
+         footer_from_props_lines(
+             props,
+@@ -821,7 +831,22 @@ pub(crate) fn passive_footer_status_line(props: &FooterProps) -> Option<FooterCo
+     let mut line = match status {
+         Some(FooterContent::Line(line)) => HyperlinkLine::from(line.clone()),
+         Some(FooterContent::HyperlinkLine(line)) => line.clone(),
+-        Some(content @ FooterContent::Extension { .. }) => return Some(content.clone()),
++        Some(FooterContent::StatusFields {
++            fields,
++            separator_style,
++            append_agent_label,
++        }) => {
++            let mut fields = fields.clone();
++            let suffix = passive_footer_suffix(props, /*has_status*/ true);
++            if *append_agent_label && !suffix.spans.is_empty() {
++                fields.push(suffix.into());
++            }
++            return Some(FooterContent::StatusFields {
++                fields,
++                separator_style: *separator_style,
++                append_agent_label: *append_agent_label,
++            });
++        }
+         None => HyperlinkLine::default(),
+     };
+     let suffix = passive_footer_suffix(props, status.is_some());
+diff --git a/codex-rs/tui/src/bottom_pane/footer/footer_content.rs b/codex-rs/tui/src/bottom_pane/footer/footer_content.rs
+index 32d56b5..b64990a 100644
+--- a/codex-rs/tui/src/bottom_pane/footer/footer_content.rs
++++ b/codex-rs/tui/src/bottom_pane/footer/footer_content.rs
+@@ -1,39 +1,118 @@
+ //! The composer measures the natural width before allocating the left column, then renders
+-//! the selected content in the allotted rectangle.
++//! the selected content in the allotted rectangle. Configured fields wrap as complete units;
++//! their packed rows determine both the measured height and the painted rows.
+ 
+ use ratatui::buffer::Buffer;
+ use ratatui::layout::Rect;
++use ratatui::style::Style;
++use ratatui::style::Styled;
+ use ratatui::text::Line;
++use ratatui::text::Span;
+ use ratatui::widgets::Widget;
+ 
++use crate::bottom_pane::status_line_style::STATUS_LINE_SEPARATOR;
+ use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
+ use crate::terminal_hyperlinks::HyperlinkLine;
+-use crate::ui_tree::UiNode;
+ 
+ /// Owned content for the footer's negotiated left-hand area.
+ #[derive(Clone, Debug, PartialEq)]
+ pub(crate) enum FooterContent {
+     Line(Line<'static>),
+     HyperlinkLine(HyperlinkLine),
+-    Extension { content: UiNode },
++    StatusFields {
++        fields: Vec<HyperlinkLine>,
++        separator_style: Style,
++        append_agent_label: bool,
++    },
+ }
+ 
+ impl FooterContent {
+     /// Natural display width, before the footer allocates space for the right indicator.
+     pub(crate) fn width(&self) -> u16 {
+         let width = match self {
++            Self::StatusFields {
++                fields,
++                separator_style,
++                ..
++            } => join_fields(fields.iter().cloned(), *separator_style).width(),
+             Self::Line(line) => line.width(),
+             Self::HyperlinkLine(line) => line.width(),
+-            Self::Extension { content } => content.render_line(u16::MAX).width(),
+         };
+         u16::try_from(width).unwrap_or(u16::MAX)
+     }
+ 
++    /// Use the same field packing for measurement and painting.
++    pub(crate) fn height(&self, width: u16) -> u16 {
++        match self {
++            Self::StatusFields { .. } => self
++                .wrapped_lines(width)
++                .len()
++                .try_into()
++                .unwrap_or(u16::MAX),
++            _ => u16::from(width > 0),
++        }
++    }
++
++    pub(crate) fn wrapped_lines(&self, width: u16) -> Vec<HyperlinkLine> {
++        if width == 0 {
++            return Vec::new();
++        }
++        let Self::StatusFields {
++            fields,
++            separator_style,
++            ..
++        } = self
++        else {
++            return vec![self.clone().into_hyperlink_line()];
++        };
++        let width = usize::from(width);
++        let mut rows = Vec::new();
++        let mut row = HyperlinkLine::default();
++
++        for field in fields {
++            if !row.line.spans.is_empty()
++                && row.width() + Span::raw(STATUS_LINE_SEPARATOR).width() + field.width() > width
++            {
++                rows.push(row);
++                row = HyperlinkLine::default();
++            }
++            if !row.line.spans.is_empty() {
++                row.line
++                    .push_span(STATUS_LINE_SEPARATOR.set_style(*separator_style));
++            }
++            append_line(&mut row, field.clone());
++            if row.width() > width {
++                row.line = truncate_line_with_ellipsis_if_overflow(row.line, width);
++                row.clip_hyperlinks_to_width(row.width().saturating_sub(1));
++            }
++        }
++
++        if !row.line.spans.is_empty() {
++            rows.push(row);
++        }
++
++        rows
++    }
++
+     /// Paint only inside the final area supplied by the parent.
+     pub(crate) fn render(self, area: Rect, buf: &mut Buffer) {
+         match self {
++            content @ Self::StatusFields { .. } => {
++                for (offset, row) in content.wrapped_lines(area.width).into_iter().enumerate() {
++                    if offset >= usize::from(area.height) {
++                        break;
++                    }
++                    row.render_fitted(
++                        Rect {
++                            y: area.y + offset as u16,
++                            height: 1,
++                            ..area
++                        },
++                        buf,
++                    );
++                }
++            }
+             Self::Line(line) => Widget::render(line, area, buf),
+-            Self::Extension { content } => content.render_line(area.width).render_fitted(area, buf),
+             Self::HyperlinkLine(mut line) => {
+                 let area = Rect {
+                     height: area.height.min(1),
+@@ -53,13 +132,44 @@ impl FooterContent {
+     /// Keep link destinations when handing the status line to the effort transition.
+     pub(crate) fn into_hyperlink_line(self) -> HyperlinkLine {
+         match self {
++            Self::StatusFields {
++                fields,
++                separator_style,
++                ..
++            } => join_fields(fields, separator_style),
+             Self::Line(line) => line.into(),
+             Self::HyperlinkLine(line) => line,
+-            Self::Extension { content } => content.render_line(u16::MAX),
+         }
+     }
+ }
+ 
++fn append_line(row: &mut HyperlinkLine, field: HyperlinkLine) {
++    let offset = row.width();
++    let field = field.resolve_span_styles();
++    row.hyperlinks.extend(
++        field
++            .hyperlinks
++            .into_iter()
++            .map(|link| link.with_columns(link.columns.start + offset..link.columns.end + offset)),
++    );
++    row.line.spans.extend(field.line.spans);
++}
++
++fn join_fields(
++    fields: impl IntoIterator<Item = HyperlinkLine>,
++    separator_style: Style,
++) -> HyperlinkLine {
++    let mut row = HyperlinkLine::default();
++    for field in fields {
++        if !row.line.spans.is_empty() {
++            row.line
++                .push_span(STATUS_LINE_SEPARATOR.set_style(separator_style));
++        }
++        append_line(&mut row, field);
++    }
++    row
++}
++
+ impl From<HyperlinkLine> for FooterContent {
+     fn from(line: HyperlinkLine) -> Self {
+         Self::HyperlinkLine(line)
+diff --git a/codex-rs/tui/src/bottom_pane/footer/footer_content_tests.rs b/codex-rs/tui/src/bottom_pane/footer/footer_content_tests.rs
+index e809c5d..7b43eab 100644
+--- a/codex-rs/tui/src/bottom_pane/footer/footer_content_tests.rs
++++ b/codex-rs/tui/src/bottom_pane/footer/footer_content_tests.rs
+@@ -54,3 +54,161 @@ fn arabic_prefix_keeps_link_on_the_painted_cells_at_exact_fit_and_overflow() {
+         }
+     }
+ }
++
++fn status_fields(values: &[&str]) -> FooterContent {
++    FooterContent::StatusFields {
++        fields: values
++            .iter()
++            .map(|value| HyperlinkLine::from((*value).to_string()))
++            .collect(),
++        separator_style: crate::style::secondary_text_style(),
++        append_agent_label: true,
++    }
++}
++
++fn row_text(row: &HyperlinkLine) -> String {
++    row.line
++        .spans
++        .iter()
++        .map(|span| span.content.as_ref())
++        .collect()
++}
++
++#[test]
++fn status_fields_pack_whole_fields_at_exact_boundaries_and_reflow() {
++    let content = status_fields(&["model", "main", "12k tokens", "ready"]);
++    assert_eq!(content.height(80), 1);
++    assert_eq!(
++        row_text(&content.wrapped_lines(80)[0]),
++        "model · main · 12k tokens · ready"
++    );
++    assert_eq!(
++        content
++            .wrapped_lines(12)
++            .iter()
++            .map(row_text)
++            .collect::<Vec<_>>(),
++        ["model · main", "12k tokens", "ready"]
++    );
++    assert_eq!(content.height(11), 4);
++    assert_eq!(content.height(80), 1);
++}
++
++#[test]
++fn status_fields_preserve_embedded_separators_and_unicode_display_widths() {
++    let content = status_fields(&["a · b", "漢字", "e\u{301}", "😀"]);
++    assert_eq!(
++        content
++            .wrapped_lines(10)
++            .iter()
++            .map(row_text)
++            .collect::<Vec<_>>(),
++        ["a · b", "漢字 · e\u{301}", "😀"]
++    );
++    assert_eq!(
++        content
++            .wrapped_lines(5)
++            .iter()
++            .map(row_text)
++            .collect::<Vec<_>>(),
++        ["a · b", "漢字", "e\u{301}", "😀"]
++    );
++}
++
++#[test]
++fn oversized_fields_are_bounded_without_losing_subsequent_fields() {
++    let content = status_fields(&["long value", "ok", "漢字"]);
++    assert_eq!(
++        content
++            .wrapped_lines(4)
++            .iter()
++            .map(row_text)
++            .collect::<Vec<_>>(),
++        ["lon…", "ok", "漢字"]
++    );
++    assert!(content.wrapped_lines(0).is_empty());
++    assert_eq!(content.height(0), 0);
++
++    let rows = content.wrapped_lines(1);
++    assert_eq!(rows.len(), 3);
++    assert!(rows.iter().all(|row| row.width() <= 1));
++}
++
++#[test]
++fn wrapped_status_fields_preserve_styles_and_link_offsets_without_linking_ellipsis() {
++    let url = "https://example.com/pr/42";
++    let mut link = HyperlinkLine::default();
++    link.push_span(
++        ratatui::text::Span::styled(
++            "PR #42",
++            ratatui::style::Style::default().fg(ratatui::style::Color::Cyan),
++        ),
++        Some(url),
++    );
++
++    let content = FooterContent::StatusFields {
++        fields: vec![HyperlinkLine::from("漢字"), link],
++        separator_style: crate::style::secondary_text_style(),
++        append_agent_label: true,
++    };
++
++    for (width, expected_row, linked_cells) in [(13, 0, 6), (8, 1, 6), (5, 1, 4)] {
++        let area = Rect::new(0, 0, width, content.height(width));
++        let mut buf = Buffer::empty(area);
++        content.clone().render(area, &mut buf);
++        let links = area
++            .positions()
++            .filter(|position| buf[*position].symbol().contains(url))
++            .collect::<Vec<_>>();
++        assert_eq!(links.len(), linked_cells, "{buf:?}");
++        assert!(links.iter().all(|position| position.y == expected_row));
++        assert!(
++            links
++                .iter()
++                .all(|position| buf[*position].fg == ratatui::style::Color::Cyan)
++        );
++        assert!(
++            links
++                .iter()
++                .all(|position| !buf[*position].symbol().contains('…'))
++        );
++    }
++}
++
++#[test]
++fn both_configured_renderers_preserve_field_boundaries_and_links() {
++    use crate::bottom_pane::status_line_content::StatusLineRenderer;
++    use crate::bottom_pane::status_line_setup::StatusLineItem;
++
++    for renderer in [StatusLineRenderer::Native, StatusLineRenderer::Extension] {
++        let content = renderer
++            .content(
++                [
++                    (StatusLineItem::ThreadTitle, "a · b".to_string()),
++                    (StatusLineItem::PullRequestNumber, "PR #42".to_string()),
++                ],
++                false,
++                None,
++                Some("https://example.com/pr/42"),
++            )
++            .unwrap();
++        let rows = content.wrapped_lines(8);
++        assert_eq!(
++            rows.iter().map(row_text).collect::<Vec<_>>(),
++            ["a · b", "PR #42"]
++        );
++        assert_eq!(rows[1].hyperlinks.len(), 1);
++        assert_eq!(rows[1].hyperlinks[0].columns, 0..6);
++
++        let joined = content.into_hyperlink_line();
++        assert_eq!(row_text(&joined), "a · b · PR #42");
++        assert_eq!(
++            joined.line.spans[1].style,
++            if renderer == StatusLineRenderer::Native {
++                crate::style::secondary_text_style()
++            } else {
++                Default::default()
++            }
++        );
++    }
++}
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index aef7c53..1282a85 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -121,7 +121,6 @@ pub(crate) use footer::footer_content;
+ pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
+ pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+ pub(crate) use request_user_input::RequestUserInputOverlay;
+-pub(crate) use status_line_style::STATUS_LINE_SEPARATOR;
+ pub(crate) use status_line_style::status_line_from_segments;
+ pub(crate) use voice_strip::VoiceStripPhase;
+ pub(crate) use voice_strip::VoiceStripState;
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_content.rs b/codex-rs/tui/src/bottom_pane/status_line_content.rs
+index 47c52f5..19587bd 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_content.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_content.rs
+@@ -1,13 +1,12 @@
+ //! Builds the configured status line for both the footer and its live picker preview.
+ 
+-use super::STATUS_LINE_SEPARATOR;
+ use super::footer_content::FooterContent;
+ use super::status_line_from_segments;
+ use super::status_line_setup::StatusLineItem;
++use crate::style::secondary_text_style;
+ use crate::ui_tree::Key;
+ use crate::ui_tree::LinkHref;
+ use crate::ui_tree::LinkProps;
+-use crate::ui_tree::StackProps;
+ use crate::ui_tree::UiNode;
+ use codex_protocol::ThreadId;
+ 
+@@ -25,20 +24,18 @@ impl StatusLineRenderer {
+         thread_id: Option<ThreadId>,
+         pull_request_url: Option<&str>,
+     ) -> Option<FooterContent> {
+-        if self == Self::Native {
+-            return status_line_from_segments(
+-                segments,
+-                use_theme_colors,
+-                thread_id,
+-                pull_request_url,
+-            )
+-            .map(FooterContent::HyperlinkLine);
+-        }
+-
+-        let mut children = Vec::new();
++        let mut fields = Vec::new();
+         for (item, text) in segments {
+-            if !children.is_empty() {
+-                children.push(Some(UiNode::text(/*key*/ None, STATUS_LINE_SEPARATOR)));
++            if self == Self::Native {
++                if let Some(field) = status_line_from_segments(
++                    [(item, text)],
++                    use_theme_colors,
++                    thread_id,
++                    pull_request_url,
++                ) {
++                    fields.push(field);
++                }
++                continue;
+             }
+             let key = Some(Key::String(item.to_string()));
+             let node = if item == StatusLineItem::PullRequestNumber
+@@ -52,13 +49,16 @@ impl StatusLineRenderer {
+             } else {
+                 UiNode::text(key, text)
+             };
+-            children.push(Some(node));
++            fields.push(node.render_line(u16::MAX));
+         }
+-        let tree = UiNode::Row {
+-            key: Some(Key::String("status-line".to_string())),
+-            props: StackProps::default(),
+-            children,
+-        };
+-        Some(FooterContent::Extension { content: tree })
++        (self == Self::Extension || !fields.is_empty()).then_some(FooterContent::StatusFields {
++            fields,
++            separator_style: if self == Self::Native {
++                secondary_text_style()
++            } else {
++                Default::default()
++            },
++            append_agent_label: self == Self::Native,
++        })
+     }
+ }

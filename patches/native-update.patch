@@ -1,0 +1,549 @@
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 1c3fe17..ec86597 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -795,6 +795,15 @@ fn run_update_action(
+     action: UpdateAction,
+     cli_executable: Option<&std::path::Path>,
+ ) -> anyhow::Result<()> {
++    if let UpdateAction::Custom(version) = action {
++        let version = version.ok_or_else(|| {
++            anyhow::anyhow!(
++                "Custom updates require an exact version: use Update now in the startup prompt or codex-custom-update --version X.Y.Z"
++            )
++        })?;
++        let root = std::env::var_os(codex_tui::CODEX_CUSTOM_UPDATE_ROOT);
++        return run_custom_update(version, root.as_deref());
++    }
+     if let UpdateAction::Daemon(source) = action {
+         let executable = cli_executable
+             .ok_or_else(|| anyhow::anyhow!("Cannot locate the launching Codex CLI"))?;
+@@ -843,7 +852,7 @@ fn run_update_action(
+             let (cmd, args) = action.command_args();
+             let command_path = crate::wsl_paths::normalize_for_wsl(cmd);
+             let normalized_args: Vec<String> = args
+-                .iter()
++                .into_iter()
+                 .map(crate::wsl_paths::normalize_for_wsl)
+                 .collect();
+             std::process::Command::new(&command_path)
+@@ -860,6 +869,48 @@ fn run_update_action(
+     Ok(())
+ }
+ 
++fn custom_update_executable(root: Option<&std::ffi::OsStr>) -> anyhow::Result<PathBuf> {
++    let root = root.ok_or_else(|| anyhow::anyhow!("Custom update root is missing"))?;
++    let root = std::path::Path::new(root);
++    anyhow::ensure!(root.is_absolute(), "Custom update root must be absolute");
++    let executable = root.join("bin").join("codex-custom-update");
++    let metadata = std::fs::metadata(&executable).map_err(|error| {
++        anyhow::anyhow!(
++            "Custom updater {} is unavailable: {error}",
++            executable.display()
++        )
++    })?;
++    anyhow::ensure!(metadata.is_file(), "Custom updater must be a file");
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        anyhow::ensure!(
++            metadata.permissions().mode() & 0o111 != 0,
++            "Custom updater is not executable"
++        );
++    }
++    Ok(executable)
++}
++
++fn run_custom_update(
++    version: codex_tui::CustomUpdateVersion,
++    root: Option<&std::ffi::OsStr>,
++) -> anyhow::Result<()> {
++    let executable = custom_update_executable(root)?;
++    println!("Updating custom Codex to {version}...");
++    let update_cwd = tempfile::tempdir()?;
++    let status = std::process::Command::new(executable)
++        .args(["--version", &version.to_string()])
++        .current_dir(update_cwd.path())
++        .status()?;
++    anyhow::ensure!(
++        status.success(),
++        "Custom update failed with status {status}"
++    );
++    println!("Update ran successfully! Please restart Codex.");
++    Ok(())
++}
++
+ #[cfg(windows)]
+ fn resolve_windows_update_command_from_path(
+     command: &str,
+@@ -2789,6 +2840,71 @@ mod tests {
+     use codex_tui::TokenUsage;
+     use pretty_assertions::assert_eq;
+ 
++    #[test]
++    fn custom_updater_rejects_missing_relative_and_unavailable_roots() {
++        assert!(custom_update_executable(None).is_err());
++        assert!(custom_update_executable(Some(std::ffi::OsStr::new("relative"))).is_err());
++        let root = tempfile::tempdir().unwrap();
++        assert!(custom_update_executable(Some(root.path().as_os_str())).is_err());
++        let error = run_update_action(UpdateAction::Custom(None), None).unwrap_err();
++        assert!(error.to_string().contains("--version X.Y.Z"));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn custom_update_uses_fixed_updater_exact_argv_and_propagates_failure() -> anyhow::Result<()> {
++        const CHILD: &str = "CODEX_TEST_CUSTOM_UPDATE_CHILD";
++        if std::env::var_os(CHILD).is_some() {
++            let version = codex_tui::CustomUpdateVersion::parse("0.168.3").unwrap();
++            return run_update_action(UpdateAction::Custom(Some(version)), None);
++        }
++        let root = tempfile::tempdir()?;
++        let home = tempfile::tempdir()?;
++        let project = tempfile::tempdir()?;
++        std::fs::create_dir(root.path().join("bin"))?;
++        let updater = root.path().join("bin/codex-custom-update");
++        for (script, succeeds) in [
++            (
++                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\npwd -P > \"$0.cwd\"\n",
++                true,
++            ),
++            ("#!/bin/sh\nexit 7\n", false),
++        ] {
++            codex_utils_cargo_bin::write_executable(&updater, script)?;
++            let mut child = assert_cmd::Command::new(std::env::current_exe()?);
++            child
++                .args([
++                    "--exact",
++                    "tests::custom_update_uses_fixed_updater_exact_argv_and_propagates_failure",
++                ])
++                .env_clear()
++                .env("HOME", home.path())
++                .env("CODEX_HOME", home.path())
++                .env(codex_tui::CODEX_CUSTOM_UPDATE_ROOT, root.path())
++                .env(CHILD, "1")
++                .current_dir(project.path());
++            if succeeds {
++                child.assert().success();
++                assert_eq!(
++                    std::fs::read_to_string(updater.with_extension("args"))?,
++                    "--version\n0.168.3\n"
++                );
++                let cwd = std::fs::read_to_string(updater.with_extension("cwd"))?;
++                assert_ne!(std::path::Path::new(cwd.trim()), project.path());
++            } else {
++                let output = child.output()?;
++                assert!(!output.status.success());
++                let stdout = String::from_utf8_lossy(&output.stdout);
++                let stderr = String::from_utf8_lossy(&output.stderr);
++                assert!(
++                    stdout.contains("Custom update failed")
++                        || stderr.contains("Custom update failed")
++                );
++            }
++        }
++        Ok(())
++    }
++
+     #[test]
+     fn interactive_tui_future_stays_bounded() {
+         let future = run_interactive_tui(
+diff --git a/codex-rs/tui/src/history_cell/notices.rs b/codex-rs/tui/src/history_cell/notices.rs
+index 9f5e213..365464d 100644
+--- a/codex-rs/tui/src/history_cell/notices.rs
++++ b/codex-rs/tui/src/history_cell/notices.rs
+@@ -19,6 +19,7 @@ pub(crate) struct UpdateAvailableHistoryCell {
+ #[cfg_attr(debug_assertions, allow(dead_code))]
+ impl UpdateAvailableHistoryCell {
+     pub(crate) fn new(latest_version: String, update_action: Option<UpdateAction>) -> Self {
++        let update_action = update_action.and_then(|action| action.bind_version(&latest_version));
+         Self {
+             latest_version,
+             update_action,
+@@ -485,3 +486,70 @@ impl HistoryCell for ThreadRecapHistoryCell {
+         lines
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn custom_notice_binds_the_displayed_version() {
++        let cell = UpdateAvailableHistoryCell::new(
++            "0.168.3".to_string(),
++            Some(UpdateAction::Custom(None)),
++        );
++        assert_eq!(
++            cell.update_action.unwrap().command_args(),
++            (
++                "codex-custom-update",
++                vec!["--version".to_string(), "0.168.3".to_string()]
++            )
++        );
++        for lines in [cell.display_lines(120), cell.raw_lines()] {
++            let text = lines
++                .iter()
++                .map(ToString::to_string)
++                .collect::<Vec<_>>()
++                .join("\n");
++            assert!(text.contains("Run codex-custom-update --version 0.168.3 to update."));
++        }
++    }
++
++    #[test]
++    fn custom_notice_rejects_malformed_targets() {
++        for version in ["", "1.2", "01.2.3", "1.2.3-beta", "1.2.3;echo bad"] {
++            let cell = UpdateAvailableHistoryCell::new(
++                version.to_string(),
++                Some(UpdateAction::Custom(None)),
++            );
++            assert_eq!(cell.update_action, None);
++            for lines in [cell.display_lines(120), cell.raw_lines()] {
++                let text = lines
++                    .iter()
++                    .map(ToString::to_string)
++                    .collect::<Vec<_>>()
++                    .join("\n");
++                assert!(!text.contains("Run "));
++                assert!(!text.contains("codex-custom-update"));
++                assert!(text.contains("for installation options."));
++            }
++        }
++    }
++
++    #[test]
++    fn custom_notice_preserves_standard_update_commands() {
++        let cell = UpdateAvailableHistoryCell::new(
++            "9.9.9".to_string(),
++            Some(UpdateAction::PnpmGlobalLatest),
++        );
++        assert_eq!(cell.update_action, Some(UpdateAction::PnpmGlobalLatest));
++        for lines in [cell.display_lines(120), cell.raw_lines()] {
++            let text = lines
++                .iter()
++                .map(ToString::to_string)
++                .collect::<Vec<_>>()
++                .join("\n");
++            assert!(text.contains("Run pnpm add -g @openai/codex to update."));
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index e1bf622..f7b15bf 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -252,6 +252,8 @@ mod ui_tree;
+ mod unarchive_prompt;
+ pub(crate) mod update_action;
+ mod worktree_startup;
++pub use update_action::CODEX_CUSTOM_UPDATE_ROOT;
++pub use update_action::CustomUpdateVersion;
+ pub use update_action::DaemonUpdateSource;
+ pub use update_action::UpdateAction;
+ #[cfg(not(debug_assertions))]
+diff --git a/codex-rs/tui/src/update_action.rs b/codex-rs/tui/src/update_action.rs
+index 7b3433e..98f25ce 100644
+--- a/codex-rs/tui/src/update_action.rs
++++ b/codex-rs/tui/src/update_action.rs
+@@ -5,9 +5,13 @@ use codex_install_context::InstallMethod;
+ #[cfg(any(not(debug_assertions), test))]
+ use codex_install_context::StandalonePlatform;
+ 
++pub const CODEX_CUSTOM_UPDATE_ROOT: &str = "CODEX_CUSTOM_UPDATE_ROOT";
++
+ /// Update action the CLI should perform after the TUI exits.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum UpdateAction {
++    /// Build and select the exact stable version shown by the native prompt.
++    Custom(Option<CustomUpdateVersion>),
+     /// Replace the local daemon after restoring the terminal.
+     Daemon(DaemonUpdateSource),
+     /// Update via `npm install -g @openai/codex@latest`.
+@@ -43,9 +47,24 @@ impl UpdateAction {
+         }
+     }
+ 
+-    /// Returns the list of command-line arguments for invoking the update.
+-    pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
++    pub(crate) fn bind_version(self, version: &str) -> Option<Self> {
+         match self {
++            Self::Custom(_) => Some(Self::Custom(Some(CustomUpdateVersion::parse(version)?))),
++            other => Some(other),
++        }
++    }
++
++    /// Returns the list of command-line arguments for invoking the update.
++    pub fn command_args(self) -> (&'static str, Vec<String>) {
++        let (command, args): (_, &[&str]) = match self {
++            UpdateAction::Custom(version) => {
++                return (
++                    "codex-custom-update",
++                    version.map_or_else(Vec::new, |version| {
++                        vec!["--version".to_string(), version.to_string()]
++                    }),
++                );
++            }
+             UpdateAction::Daemon(source) => ("codex", source.command_args()),
+             UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
+             UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
+@@ -68,20 +87,63 @@ impl UpdateAction {
+                     "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex",
+                 ],
+             ),
+-        }
++        };
++        (command, args.iter().map(|arg| (*arg).to_string()).collect())
+     }
+ 
+     /// Returns string representation of the command-line arguments for invoking the update.
+     pub fn command_str(self) -> String {
+         let (command, args) = self.command_args();
+-        shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
++        shlex::try_join(std::iter::once(command).chain(args.iter().map(String::as_str)))
+             .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
+     }
+ }
+ 
+ #[cfg(not(debug_assertions))]
+ pub fn get_update_action() -> Option<UpdateAction> {
+-    UpdateAction::from_install_context(InstallContext::current())
++    match std::env::var_os(CODEX_CUSTOM_UPDATE_ROOT) {
++        Some(root) => custom_update_action(&root),
++        None => UpdateAction::from_install_context(InstallContext::current()),
++    }
++}
++
++#[cfg(any(not(debug_assertions), test))]
++fn custom_update_action(root: &std::ffi::OsStr) -> Option<UpdateAction> {
++    std::path::Path::new(root)
++        .is_absolute()
++        .then_some(UpdateAction::Custom(None))
++}
++
++/// Stable numeric release target, validated before an update is offered.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct CustomUpdateVersion([u64; 3]);
++
++impl CustomUpdateVersion {
++    pub fn parse(version: &str) -> Option<Self> {
++        let mut components = version.split('.');
++        let mut values = [0; 3];
++        for value in &mut values {
++            let component = components.next()?;
++            if component.is_empty()
++                || !component.bytes().all(|byte| byte.is_ascii_digit())
++                || (component.len() > 1 && component.starts_with('0'))
++            {
++                return None;
++            }
++            *value = component.parse().ok()?;
++        }
++        if components.next().is_some() {
++            return None;
++        }
++        Some(Self(values))
++    }
++}
++
++impl std::fmt::Display for CustomUpdateVersion {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let [major, minor, patch] = self.0;
++        write!(f, "{major}.{minor}.{patch}")
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -90,6 +152,56 @@ mod tests {
+     use codex_utils_absolute_path::AbsolutePathBuf;
+     use pretty_assertions::assert_eq;
+ 
++    #[test]
++    fn custom_target_preserves_exact_stable_version() {
++        let action = UpdateAction::Custom(None).bind_version("0.167.2").unwrap();
++        assert_eq!(
++            action.command_args(),
++            (
++                "codex-custom-update",
++                vec!["--version".to_string(), "0.167.2".to_string()]
++            )
++        );
++        assert_eq!(
++            action.command_str(),
++            "codex-custom-update --version 0.167.2"
++        );
++    }
++
++    #[test]
++    fn custom_target_rejects_malformed_versions() {
++        for version in [
++            "",
++            "1.2",
++            "1.2.3.4",
++            "01.2.3",
++            "1.02.3",
++            "1.2.03",
++            "1.2.3-beta",
++            "1.2.3+build",
++            "1.2.3;echo bad",
++            "../1.2.3",
++            " 1.2.3",
++            "1.2.3\n",
++            "18446744073709551616.2.3",
++        ] {
++            assert!(
++                UpdateAction::Custom(None).bind_version(version).is_none(),
++                "{version:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn custom_marker_requires_an_absolute_root() {
++        assert_eq!(custom_update_action(std::ffi::OsStr::new("relative")), None);
++        assert_eq!(custom_update_action(std::ffi::OsStr::new("")), None);
++        assert_eq!(
++            custom_update_action(std::env::temp_dir().as_os_str()),
++            Some(UpdateAction::Custom(None))
++        );
++    }
++
+     #[test]
+     fn maps_install_context_to_update_action() {
+         let native_release_dir =
+@@ -161,12 +273,14 @@ mod tests {
+             UpdateAction::StandaloneWindows.command_args(),
+             (
+                 "powershell",
+-                &[
++                [
+                     "-ExecutionPolicy",
+                     "Bypass",
+                     "-c",
+                     "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
+-                ][..],
++                ]
++                .map(str::to_string)
++                .to_vec(),
+             )
+         );
+     }
+@@ -178,7 +292,7 @@ mod tests {
+         let offline_command = args[1].replace("https://chatgpt.com", "file:///dev/null");
+         assert_ne!(offline_command, args[1], "installer URL must be replaced");
+         let output = std::process::Command::new(command)
+-            .args([args[0], &offline_command])
++            .args([args[0].as_str(), &offline_command])
+             .env_clear()
+             .env("HOME", "/dev/null")
+             .env("PATH", "/usr/bin:/bin")
+diff --git a/codex-rs/tui/src/update_prompt.rs b/codex-rs/tui/src/update_prompt.rs
+index 30e948d..968fc01 100644
+--- a/codex-rs/tui/src/update_prompt.rs
++++ b/codex-rs/tui/src/update_prompt.rs
+@@ -59,8 +59,11 @@ pub(crate) async fn run_update_prompt_if_needed(
+         return Ok(UpdatePromptOutcome::Continue);
+     };
+ 
+-    let mut screen =
+-        UpdatePromptScreen::new(tui.frame_requester(), latest_version.clone(), update_action);
++    let Some(mut screen) =
++        UpdatePromptScreen::new(tui.frame_requester(), latest_version, update_action)
++    else {
++        return Ok(UpdatePromptOutcome::Continue);
++    };
+     tui.draw(u16::MAX, |frame| {
+         frame.render_widget_ref(&screen, frame.area());
+     })?;
+@@ -89,7 +92,7 @@ pub(crate) async fn run_update_prompt_if_needed(
+     match screen.selection() {
+         Some(UpdateSelection::UpdateNow) => {
+             tui.terminal.clear()?;
+-            Ok(UpdatePromptOutcome::RunUpdate(update_action))
++            Ok(UpdatePromptOutcome::RunUpdate(screen.update_action))
+         }
+         Some(UpdateSelection::NotNow) | None => Ok(UpdatePromptOutcome::Continue),
+         Some(UpdateSelection::DontRemind) => {
+@@ -122,15 +125,16 @@ impl UpdatePromptScreen {
+         request_frame: FrameRequester,
+         latest_version: String,
+         update_action: UpdateAction,
+-    ) -> Self {
+-        Self {
++    ) -> Option<Self> {
++        let update_action = update_action.bind_version(&latest_version)?;
++        Some(Self {
+             request_frame,
+             latest_version,
+             current_version: env!("CARGO_PKG_VERSION").to_string(),
+             update_action,
+             highlighted: UpdateSelection::UpdateNow,
+             selection: None,
+-        }
++        })
+     }
+ 
+     fn handle_key(&mut self, key_event: KeyEvent) {
+@@ -288,6 +292,42 @@ mod tests {
+             "9.9.9".into(),
+             UpdateAction::NpmGlobalLatest,
+         )
++        .unwrap()
++    }
++
++    #[test]
++    fn custom_prompt_binds_displayed_target_and_preserves_skip_choices() {
++        let latest = "0.168.3";
++        let action = UpdateAction::Custom(None);
++        for (key, expected) in [
++            (KeyCode::Enter, UpdateSelection::UpdateNow),
++            (KeyCode::Char('2'), UpdateSelection::NotNow),
++            (KeyCode::Esc, UpdateSelection::NotNow),
++            (KeyCode::Char('3'), UpdateSelection::DontRemind),
++        ] {
++            let mut screen =
++                UpdatePromptScreen::new(FrameRequester::test_dummy(), latest.to_string(), action)
++                    .unwrap();
++            screen.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
++            assert_eq!(screen.selection(), Some(expected));
++            assert_eq!(screen.latest_version, latest);
++            assert_eq!(
++                screen.update_action.command_args().1,
++                vec!["--version", latest]
++            );
++        }
++    }
++
++    #[test]
++    fn custom_prompt_rejects_invalid_target_before_display() {
++        assert!(
++            UpdatePromptScreen::new(
++                FrameRequester::test_dummy(),
++                "0.168.3-beta".to_string(),
++                UpdateAction::Custom(None),
++            )
++            .is_none()
++        );
+     }
+ 
+     #[test]
+diff --git a/codex-rs/tui/src/updates.rs b/codex-rs/tui/src/updates.rs
+index 9bbdf31..18d3071 100644
+--- a/codex-rs/tui/src/updates.rs
++++ b/codex-rs/tui/src/updates.rs
+@@ -110,9 +110,10 @@ async fn check_for_update(
+             npm_registry::ensure_version_ready(&package_info, &latest_version)?;
+             latest_version
+         }
+-        Some(UpdateAction::StandaloneUnix) | Some(UpdateAction::StandaloneWindows) | None => {
+-            fetch_latest_github_release_version(&client_pool).await?
+-        }
++        Some(UpdateAction::Custom(_))
++        | Some(UpdateAction::StandaloneUnix)
++        | Some(UpdateAction::StandaloneWindows)
++        | None => fetch_latest_github_release_version(&client_pool).await?,
+     };
+ 
+     // Preserve any previously dismissed version if present.

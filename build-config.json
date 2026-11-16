@@ -1,0 +1,75 @@
+{
+  "version": "0.167.2",
+  "upstream_commit": "ce21072c90d32c40af7a55b60b2fb35c84a43a6a",
+  "toolchain": "1.95.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "profile": "dev-small",
+  "patches": {
+    "status-wrap.patch": "ae2630f60d887552d73c0a975652365faa05fab43098dad2567a65a1f17a11e5",
+    "native-update.patch": "b4a35b96e1dfac1d21e2b0a7e5e3083ce2a122e24ccaa700501200fc38f556d3"
+  },
+  "test_groups": [
+    [
+      "codex-tui",
+      "custom_",
+      [
+        "custom_target_preserves_exact_stable_version",
+        "custom_target_rejects_malformed_versions",
+        "custom_marker_requires_an_absolute_root",
+        "custom_prompt_binds_displayed_target_and_preserves_skip_choices",
+        "custom_prompt_rejects_invalid_target_before_display",
+        "custom_notice_binds_the_displayed_version",
+        "custom_notice_rejects_malformed_targets",
+        "custom_notice_preserves_standard_update_commands"
+      ]
+    ],
+    [
+      "codex-tui",
+      "token_usage_update_refreshes_status_line_with_runtime_context_window",
+      [
+        "token_usage_update_refreshes_status_line_with_runtime_context_window"
+      ]
+    ],
+    [
+      "codex-tui",
+      "maps_install_context_to_update_action",
+      [
+        "maps_install_context_to_update_action"
+      ]
+    ],
+    [
+      "codex-cli",
+      "custom_",
+      [
+        "custom_updater_rejects_missing_relative_and_unavailable_roots",
+        "custom_update_uses_fixed_updater_exact_argv_and_propagates_failure"
+      ]
+    ],
+    [
+      "codex-tui",
+      "footer_content::tests",
+      [
+        "status_fields_pack_whole_fields_at_exact_boundaries_and_reflow",
+        "status_fields_preserve_embedded_separators_and_unicode_display_widths",
+        "oversized_fields_are_bounded_without_losing_subsequent_fields",
+        "wrapped_status_fields_preserve_styles_and_link_offsets_without_linking_ellipsis",
+        "both_configured_renderers_preserve_field_boundaries_and_links",
+        "clipped_links_keep_their_cells_after_a_halfwidth_katakana_grapheme",
+        "arabic_prefix_keeps_link_on_the_painted_cells_at_exact_fit_and_overflow"
+      ]
+    ],
+    [
+      "codex-tui",
+      "status_surface::tests",
+      [
+        "configured_extension_status_fields_wrap_with_complete_links",
+        "configured_fields_resize_without_overlapping_composer_input",
+        "wrapped_status_keeps_warning_and_transient_hint_priority",
+        "effort_transition_preserves_following_wrapped_status_rows",
+        "wrapped_status_reserves_the_compact_right_indicator_on_its_final_row",
+        "configured_renderers_retain_their_existing_active_agent_suffix_policy",
+        "empty_configured_renderers_preserve_active_agent_suffix_behavior"
+      ]
+    ]
+  ]
+}

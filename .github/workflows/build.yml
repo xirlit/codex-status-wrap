@@ -1,0 +1,60 @@
+name: Build patched Codex trial
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  trial:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Require hosted Linux runner
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          assert sys.platform == 'linux'
+          assert all(os.environ.get(k) == v for k, v in {
+              'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_OS': 'Linux'
+          }.items())
+          PY
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Run lightweight automation tests
+        run: python3 -B -m unittest discover -s tests -v
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/codex-trial-dependencies/cargo/registry
+            ${{ runner.temp }}/codex-trial-dependencies/cargo/git
+            ${{ runner.temp }}/codex-trial-dependencies/v8
+          key: codex-public-deps-v1-${{ hashFiles('build-config.json') }}-${{ github.run_id }}
+          restore-keys: codex-public-deps-v1-${{ hashFiles('build-config.json') }}-
+      - name: Build and validate fixed trial
+        run: python3 scripts/build_trial.py
+      - name: Check dependency cache size
+        id: cache-size
+        run: python3 scripts/build_trial.py --cache-check
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.cache-size.outputs.save == 'true'
+        with:
+          path: |
+            ${{ runner.temp }}/codex-trial-dependencies/cargo/registry
+            ${{ runner.temp }}/codex-trial-dependencies/cargo/git
+            ${{ runner.temp }}/codex-trial-dependencies/v8
+          key: codex-public-deps-v1-${{ hashFiles('build-config.json') }}-${{ github.run_id }}
+      - name: Upload validated trial
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-validated-trial
+          path: ${{ runner.temp }}/payload/
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-trial-diagnostics
+          path: ${{ runner.temp }}/codex-trial-diagnostics/
+          if-no-files-found: warn
+          retention-days: 3
